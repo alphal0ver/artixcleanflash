@@ -338,6 +338,7 @@ echo "-> Setting up realtime audio scheduling (rtprio) for pipewire..."
 # picks this up automatically without needing an extra system service.
 groupadd -f realtime
 usermod -aG realtime,audio,video "$USERNAME"
+mkdir -p /etc/security/limits.d
 cat > /etc/security/limits.d/99-realtime-audio.conf << 'LIMITS_EOF'
 @realtime - rtprio 95
 @realtime - memlock unlimited
