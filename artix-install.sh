@@ -234,20 +234,33 @@ STAGE2_PKGS=(
 pacman -S --noconfirm --needed "${STAGE2_PKGS[@]}"
 
 echo "-> Configuring zram (zramen)..."
-# zramen reads its settings from this env file. zstd gives a much better
+# zramen reads its settings from environment variables, loaded from this
+# file by its dinit service (NOT /etc/conf.d/zramen - that path doesn't
+# exist, zramen has no conf.d convention). zstd gives a much better
 # compression ratio than the lz4 default, which matters a lot on 4GB of
 # RAM; the dual-core Haswell CPU has enough headroom for it. Size is 50%
 # of RAM (2GB raw, more once compressed) since 4GB is tight. Priority
 # 32767 is zramen's own default (max) - it guarantees zram is always
 # used before the disk swap partition, matching "use RAM before disk".
-# Written here, after zramen is installed, so pacman's own default
-# config doesn't clobber it.
-cat > /etc/conf.d/zramen << 'ZRAMEN_EOF'
+cat > /etc/zramen.conf << 'ZRAMEN_EOF'
 ZRAM_SIZE=50
 ZRAM_COMP_ALGORITHM=zstd
 ZRAM_PRIORITY=32767
 ZRAMEN_SWAPON_DISCARD=both
 ZRAMEN_EOF
+
+# Sanity check: confirm the dinit service actually points at this file.
+# If Artix's packaging uses a different path than expected, this warns
+# loudly instead of silently configuring the wrong file.
+if [[ -f /etc/dinit.d/zramen ]]; then
+    if ! grep -q "zramen.conf" /etc/dinit.d/zramen 2>/dev/null; then
+        echo "   WARNING: /etc/dinit.d/zramen does not reference zramen.conf as expected."
+        echo "            Check its actual env-file path with: cat /etc/dinit.d/zramen"
+        echo "            and move /etc/zramen.conf there if it differs."
+    fi
+else
+    echo "   WARNING: /etc/dinit.d/zramen not found - zramen-dinit may not have installed correctly."
+fi
 
 echo "-> Tuning swappiness for zram..."
 mkdir -p /etc/sysctl.d
