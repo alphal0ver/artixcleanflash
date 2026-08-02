@@ -26,17 +26,29 @@ log_err()  { echo -e "\e[1;31mERROR:\e[0m $1" >&2; exit 1; }
 [[ ! -d /sys/firmware/efi ]] && log_err "System not booted in UEFI mode."
 [[ ! -b "$DISK" ]]       && log_err "Disk '$DISK' not found or is not a block device."
 
-# The base ISO (unlike the desktop spins) doesn't ship gptfdisk by default,
-# so sgdisk may be missing. Install it here rather than failing partway
-# through partitioning.
-if ! command -v sgdisk &>/dev/null; then
-    log_step "sgdisk not found - installing gptfdisk..."
-    pacman -Sy --noconfirm gptfdisk || log_err "Failed to install gptfdisk. Check network/mirrors."
-fi
-
-if ! command -v basestrap &>/dev/null || ! command -v artix-chroot &>/dev/null || ! command -v fstabgen &>/dev/null; then
-    log_step "basestrap/artix-chroot/fstabgen not found - installing artix-install-scripts..."
-    pacman -Sy --noconfirm artix-install-scripts || log_err "Failed to install artix-install-scripts. Check network/mirrors."
+# The base ISO is much leaner than the desktop spins - several tools this
+# script needs (partitioning, base-install helpers, filesystem formatters)
+# aren't guaranteed to be present. Check everything up front in one pass
+# instead of discovering each gap one failed command at a time.
+declare -A REQUIRED_TOOLS=(
+    [sgdisk]=gptfdisk
+    [partprobe]=parted
+    [basestrap]=artix-install-scripts
+    [artix-chroot]=artix-install-scripts
+    [fstabgen]=artix-install-scripts
+    [mkfs.fat]=dosfstools
+    [mkfs.ext4]=e2fsprogs
+    [udevadm]=eudev
+)
+MISSING_PKGS=()
+for tool in "${!REQUIRED_TOOLS[@]}"; do
+    command -v "$tool" &>/dev/null || MISSING_PKGS+=("${REQUIRED_TOOLS[$tool]}")
+done
+if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+    # Dedup (multiple missing tools can map to the same package)
+    mapfile -t MISSING_PKGS < <(printf '%s\n' "${MISSING_PKGS[@]}" | sort -u)
+    log_step "Missing tools detected - installing: ${MISSING_PKGS[*]}"
+    pacman -Sy --noconfirm "${MISSING_PKGS[@]}" || log_err "Failed to install required tools. Check network/mirrors."
 fi
 
 log_step "Security Check"
