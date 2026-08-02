@@ -130,7 +130,15 @@ echo "-> Using the live ISO's default mirrorlists."
 log_step "Ensuring up-to-date keyrings..."
 # Artix pulls packages from both its own repos and Arch's (via world/galaxy),
 # so both keyrings need to be current and populated.
-pacman -Syu --noconfirm artix-keyring archlinux-keyring
+#
+# IMPORTANT: this is -Sy (sync db only), not -Syu. The live session's root
+# is a RAM-backed tmpfs overlay on top of the squashfs, not real disk -
+# -Syu would upgrade every package already installed on the live media
+# (including linux-headers), and on a 4GB machine there isn't enough RAM
+# left in that overlay to extract a full kernel upgrade. -Sy + a targeted
+# --needed install only touches the two packages we actually need.
+pacman -Sy --noconfirm
+pacman -S --noconfirm --needed artix-keyring archlinux-keyring
 pacman-key --populate artix archlinux
 
 log_step "Installing minimal base system..."
