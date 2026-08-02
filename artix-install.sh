@@ -26,10 +26,7 @@ log_err()  { echo -e "\e[1;31mERROR:\e[0m $1" >&2; exit 1; }
 [[ ! -d /sys/firmware/efi ]] && log_err "System not booted in UEFI mode."
 [[ ! -b "$DISK" ]]       && log_err "Disk '$DISK' not found or is not a block device."
 
-# The base ISO is much leaner than the desktop spins - several tools this
-# script needs (partitioning, base-install helpers, filesystem formatters)
-# aren't guaranteed to be present. Check everything up front in one pass
-# instead of discovering each gap one failed command at a time.
+log_step "Checking for required tools..."
 declare -A REQUIRED_TOOLS=(
     [sgdisk]=gptfdisk
     [partprobe]=parted
@@ -42,13 +39,25 @@ declare -A REQUIRED_TOOLS=(
 )
 MISSING_PKGS=()
 for tool in "${!REQUIRED_TOOLS[@]}"; do
-    command -v "$tool" &>/dev/null || MISSING_PKGS+=("${REQUIRED_TOOLS[$tool]}")
+    if command -v "$tool" &>/dev/null; then
+        echo "   OK: $tool"
+    else
+        echo "   MISSING: $tool (from package: ${REQUIRED_TOOLS[$tool]})"
+        MISSING_PKGS+=("${REQUIRED_TOOLS[$tool]}")
+    fi
 done
 if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
     # Dedup (multiple missing tools can map to the same package)
     mapfile -t MISSING_PKGS < <(printf '%s\n' "${MISSING_PKGS[@]}" | sort -u)
-    log_step "Missing tools detected - installing: ${MISSING_PKGS[*]}"
+    log_step "Installing missing packages: ${MISSING_PKGS[*]}"
     pacman -Sy --noconfirm "${MISSING_PKGS[@]}" || log_err "Failed to install required tools. Check network/mirrors."
+    log_step "Re-checking after install..."
+    for tool in "${!REQUIRED_TOOLS[@]}"; do
+        command -v "$tool" &>/dev/null || log_err "$tool still not found after installing ${REQUIRED_TOOLS[$tool]}. Something is wrong - check manually."
+    done
+    echo "   All required tools now present."
+else
+    echo "   All required tools already present."
 fi
 
 log_step "Security Check"
