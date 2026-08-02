@@ -99,20 +99,65 @@ log_step "Ensuring up-to-date keyrings..."
 pacman -Syu --noconfirm artix-keyring archlinux-keyring
 pacman-key --populate artix archlinux
 
-log_step "Installing base system..."
-# Package list, one purpose per line. This machine is a single Intel/Haswell
-# laptop, so nothing here is auto-detected - it's hardcoded to what this
-# hardware actually needs.
+log_step "Installing minimal base system..."
+# Stage 1: just enough to get a bootable, chroot-able system. Everything
+# else (networking, XFCE, audio, bootloader, zram) gets installed in
+# Stage 2 via a plain `pacman -S` right after artix-chroot - see below.
+# This is a checkpoint, not a technical requirement: pacman already runs
+# package scriptlets inside a real chroot() whenever --root != "/", so
+# basestrap and a later `artix-chroot ... pacman -S` behave identically
+# under the hood. Splitting it just makes the install easier to debug
+# and easier to tweak the desktop package list without repartitioning.
 BASE_PKGS=(
     # Base + kernel. linux-lts for stability on old hardware. intel-ucode
     # hardcoded since this is always an Intel CPU. linux-firmware-intel
     # only (not the full linux-firmware) since it's the only vendor here.
     base linux-lts linux-firmware-intel intel-ucode
 
-    # dinit init system + session/login tracking (elogind) + system bus
+    # dinit init system + session/login tracking (elogind) + system bus.
+    # Needed at this stage so the chroot itself has an init/dbus present.
     dinit elogind-dinit
     dbus dbus-dinit
+)
+basestrap /mnt "${BASE_PKGS[@]}"
 
+log_step "Generating fstab..."
+fstabgen -U /mnt > /mnt/etc/fstab
+
+log_step "Enabling SSD TRIM (discard) on root + swap..."
+# Root is ext4 on a SATA SSD - enable online discard.
+sed -i '\#[[:space:]]/[[:space:]].*ext4# s/relatime/relatime,discard/' /mnt/etc/fstab
+# Swap partition - also enable discard.
+sed -i '/none[[:space:]]\+swap/ s/defaults/defaults,discard/' /mnt/etc/fstab
+
+# Note: zram's config file (/etc/conf.d/zramen) and the swappiness sysctl
+# are written *inside* the chroot below, after the zramen package is
+# actually installed in Stage 2 - writing them here (before the package
+# exists) would just get silently overwritten once pacman installs its
+# own default /etc/conf.d/zramen on top.
+
+# ==============================================================================
+# System Configuration (Chroot)
+# ==============================================================================
+log_step "Configuring system (chroot)..."
+
+# Write config values to files inside /mnt rather than passing PASSWORD
+# through the environment (env vars are visible in /proc/<pid>/environ)
+printf '%s\n' "$HOSTNAME" > /mnt/etc/install_hostname
+printf '%s\n' "$USERNAME" > /mnt/etc/install_username
+printf '%s\n' "$TIMEZONE" > /mnt/etc/install_timezone
+
+artix-chroot /mnt /bin/bash << 'EOF'
+set -euo pipefail
+
+HOSTNAME="$(cat /etc/install_hostname)"
+USERNAME="$(cat /etc/install_username)"
+TIMEZONE="$(cat /etc/install_timezone)"
+
+echo "-> Stage 2: installing everything beyond the minimal base..."
+pacman -Sy --noconfirm
+
+STAGE2_PKGS=(
     # Networking: connman instead of NetworkManager - lighter daemon,
     # handles both the wired I217-V and the Intel 7260 wifi fine via
     # connmanctl. wpa_supplicant backs the wifi authentication.
@@ -144,56 +189,31 @@ BASE_PKGS=(
     # launches it via XDG autostart entries when you log in.
     pipewire pipewire-alsa pipewire-pulse wireplumber
 )
-basestrap /mnt "${BASE_PKGS[@]}"
+pacman -S --noconfirm --needed "${STAGE2_PKGS[@]}"
 
-log_step "Generating fstab..."
-fstabgen -U /mnt > /mnt/etc/fstab
-
-log_step "Enabling SSD TRIM (discard) on root + swap..."
-# Root is ext4 on a SATA SSD - enable online discard.
-sed -i '\#[[:space:]]/[[:space:]].*ext4# s/relatime/relatime,discard/' /mnt/etc/fstab
-# Swap partition - also enable discard.
-sed -i '/none[[:space:]]\+swap/ s/defaults/defaults,discard/' /mnt/etc/fstab
-
-log_step "Configuring zram (zramen)..."
+echo "-> Configuring zram (zramen)..."
 # zramen reads its settings from this env file. zstd gives a much better
 # compression ratio than the lz4 default, which matters a lot on 4GB of
 # RAM; the dual-core Haswell CPU has enough headroom for it. Size is 50%
 # of RAM (2GB raw, more once compressed) since 4GB is tight. Priority
 # 32767 is zramen's own default (max) - it guarantees zram is always
 # used before the disk swap partition, matching "use RAM before disk".
-cat > /mnt/etc/conf.d/zramen << 'ZRAMEN_EOF'
+# Written here, after zramen is installed, so pacman's own default
+# config doesn't clobber it.
+cat > /etc/conf.d/zramen << 'ZRAMEN_EOF'
 ZRAM_SIZE=50
 ZRAM_COMP_ALGORITHM=zstd
 ZRAM_PRIORITY=32767
 ZRAMEN_SWAPON_DISCARD=both
 ZRAMEN_EOF
 
-log_step "Tuning swappiness for zram..."
-mkdir -p /mnt/etc/sysctl.d
-cat > /mnt/etc/sysctl.d/99-zram.conf << 'SYSCTL_EOF'
+echo "-> Tuning swappiness for zram..."
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-zram.conf << 'SYSCTL_EOF'
 # Higher swappiness makes sense when the primary swap target is
 # fast zram rather than disk. Adjust down if XFCE feels less snappy.
 vm.swappiness = 130
 SYSCTL_EOF
-
-# ==============================================================================
-# System Configuration (Chroot)
-# ==============================================================================
-log_step "Configuring system (chroot)..."
-
-# Write config values to files inside /mnt rather than passing PASSWORD
-# through the environment (env vars are visible in /proc/<pid>/environ)
-printf '%s\n' "$HOSTNAME" > /mnt/etc/install_hostname
-printf '%s\n' "$USERNAME" > /mnt/etc/install_username
-printf '%s\n' "$TIMEZONE" > /mnt/etc/install_timezone
-
-artix-chroot /mnt /bin/bash << 'EOF'
-set -euo pipefail
-
-HOSTNAME="$(cat /etc/install_hostname)"
-USERNAME="$(cat /etc/install_username)"
-TIMEZONE="$(cat /etc/install_timezone)"
 
 echo "-> Setting timezone..."
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
