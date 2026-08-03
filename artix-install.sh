@@ -340,7 +340,7 @@ if [[ -f /etc/ly/config.ini ]]; then
 else
     LY_TTY=2
 fi
-GETTY_SVC="agetty-tty${LY_TTY}"
+GETTY_SVC="getty@tty${LY_TTY}"
 if [[ -e "/etc/dinit.d/boot.d/$GETTY_SVC" ]]; then
     rm -f "/etc/dinit.d/boot.d/$GETTY_SVC"
     echo "   disabled: $GETTY_SVC (frees tty$LY_TTY for ly)"
