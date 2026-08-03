@@ -160,6 +160,15 @@ BASE_PKGS=(
     # Needed at this stage so the chroot itself has an init/dbus present.
     dinit elogind-dinit
     dbus dbus-dinit
+
+    # Core essentials - not desktop-specific, a base system needs these
+    # regardless of what's layered on top later.
+    grub efibootmgr sudo nano
+
+    # base-devel deliberately left out - Chaotic-AUR (set up later, in the
+    # chroot) covers prebuilt binaries for most AUR packages. If a package
+    # isn't mirrored there and needs local building via yay/paru, install
+    # it then: pacman -S base-devel
 )
 basestrap /mnt "${BASE_PKGS[@]}"
 
@@ -209,9 +218,6 @@ STAGE2_PKGS=(
     # zram is used first (default priority is already maximum), disk
     # swap is only the fallback once zram fills up.
     zramen zramen-dinit
-
-    # Bootloader + essentials
-    grub efibootmgr sudo nano
 
     # Graphics: HD 4600 is handled by the generic "modesetting" driver
     # inside mesa - no separate xf86-video-intel needed (it's
@@ -324,6 +330,45 @@ enable_svc elogind
 enable_svc_try connman connmand
 enable_svc zramen
 enable_svc_try ly
+
+# ly needs its tty's getty disabled first, or the two fight over the same
+# vt (garbled screen / login loop). Unlike systemd (only tty1 auto-starts),
+# dinit enables getty on every tty 1-6 by default, so this always needs
+# doing explicitly regardless of which tty ly is configured for.
+if [[ -f /etc/ly/config.ini ]]; then
+    LY_TTY="$(grep -oP '^\s*tty\s*=\s*\K[0-9]+' /etc/ly/config.ini || echo 2)"
+else
+    LY_TTY=2
+fi
+GETTY_SVC="agetty-tty${LY_TTY}"
+if [[ -e "/etc/dinit.d/boot.d/$GETTY_SVC" ]]; then
+    rm -f "/etc/dinit.d/boot.d/$GETTY_SVC"
+    echo "   disabled: $GETTY_SVC (frees tty$LY_TTY for ly)"
+elif [[ -e "/etc/dinit.d/$GETTY_SVC" ]]; then
+    echo "   note: $GETTY_SVC exists but wasn't in boot.d - nothing to disable."
+else
+    echo "   WARNING: $GETTY_SVC not found - check 'ls /etc/dinit.d/' for the"
+    echo "            actual getty service name and disable it manually if ly"
+    echo "            fights with a login prompt on its tty."
+fi
+
+echo "-> Setting up Chaotic-AUR (prebuilt binary packages, no compiling needed)..."
+# keyserver.ubuntu.com is occasionally flaky - fall back to keys.openpgp.org
+# rather than letting one unreachable keyserver stall the whole install.
+pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
+    || pacman-key --recv-key 3056513887B78AEB --keyserver keys.openpgp.org
+pacman-key --lsign-key 3056513887B78AEB
+pacman -U --noconfirm \
+    'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+    'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst'
+if ! grep -q '\[chaotic-aur\]' /etc/pacman.conf; then
+    cat >> /etc/pacman.conf << 'CHAOTIC_EOF'
+
+[chaotic-aur]
+Include = /etc/pacman.d/chaotic-mirrorlist
+CHAOTIC_EOF
+fi
+pacman -Sy --noconfirm
 
 echo "-> Creating user '$USERNAME'..."
 useradd -m -G wheel -s /bin/bash "$USERNAME"
