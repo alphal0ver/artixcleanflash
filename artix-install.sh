@@ -230,8 +230,9 @@ STAGE2_PKGS=(
     # what handles lid-close/battery/brightness keys on this laptop.
     xfce4 xfce4-power-manager
 
-    # ly: TUI login manager, no GTK greeter process needed
-    ly ly-dinit
+    # No display manager - default getty login prompt + startx instead.
+    # Avoids the whole class of getty-vs-login-manager tty conflicts entirely.
+    xorg-xinit
 
     # Audio: pipewire stack. No system dinit service needed - XFCE
     # launches it via XDG autostart entries when you log in.
@@ -329,28 +330,12 @@ enable_svc dbus
 enable_svc elogind
 enable_svc_try connman connmand
 enable_svc zramen
-enable_svc_try ly
 
-# ly needs its tty's getty disabled first, or the two fight over the same
-# vt (garbled screen / login loop). Unlike systemd (only tty1 auto-starts),
-# dinit enables getty on every tty 1-6 by default, so this always needs
-# doing explicitly regardless of which tty ly is configured for.
-if [[ -f /etc/ly/config.ini ]]; then
-    LY_TTY="$(grep -oP '^\s*tty\s*=\s*\K[0-9]+' /etc/ly/config.ini || echo 2)"
-else
-    LY_TTY=2
-fi
-GETTY_SVC="getty@tty${LY_TTY}"
-if [[ -e "/etc/dinit.d/boot.d/$GETTY_SVC" ]]; then
-    rm -f "/etc/dinit.d/boot.d/$GETTY_SVC"
-    echo "   disabled: $GETTY_SVC (frees tty$LY_TTY for ly)"
-elif [[ -e "/etc/dinit.d/$GETTY_SVC" ]]; then
-    echo "   note: $GETTY_SVC exists but wasn't in boot.d - nothing to disable."
-else
-    echo "   WARNING: $GETTY_SVC not found - check 'ls /etc/dinit.d/' for the"
-    echo "            actual getty service name and disable it manually if ly"
-    echo "            fights with a login prompt on its tty."
-fi
+# No display manager (ly kept causing tty/getty conflicts that were a pain
+# to pin down reliably across dinit versions). tty1's default agetty
+# (already enabled out of the box, nothing to configure) gives a plain
+# username/password prompt on its own - .bash_profile below auto-starts
+# X right after a successful login.
 
 echo "-> Setting up Chaotic-AUR (prebuilt binary packages, no compiling needed)..."
 # keyserver.ubuntu.com is occasionally flaky - fall back to keys.openpgp.org
@@ -372,6 +357,20 @@ pacman -Sy --noconfirm
 
 echo "-> Creating user '$USERNAME'..."
 useradd -m -G wheel -s /bin/bash "$USERNAME"
+
+echo "-> Setting up auto-startx for '$USERNAME'..."
+# After you type your username/password at the tty1 login prompt, this
+# starts X automatically - only on tty1, only if X isn't already running,
+# so switching to another tty and back doesn't try to spawn a second X.
+cat > "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
+if [[ -z "$DISPLAY" && "$(tty)" == "/dev/tty1" ]]; then
+    exec startx
+fi
+PROFILE_EOF
+cat > "/home/$USERNAME/.xinitrc" << 'XINITRC_EOF'
+exec startxfce4
+XINITRC_EOF
+chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile" "/home/$USERNAME/.xinitrc"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
@@ -416,7 +415,7 @@ echo "  2. Remove the installation USB"
 echo "  3. reboot"
 echo ""
 echo "After reboot:"
-echo "  - ly should give you a TUI login prompt; log in and pick the XFCE session."
+echo "  - You'll get a plain login prompt on tty1; log in and XFCE starts automatically."
 echo "  - Wifi: connmanctl enable wifi; connmanctl scan wifi; connmanctl connect <service>"
 echo "  - Verify zram:   zramctl        (should show a ~2GB zstd device, priority 32767)"
 echo "  - Verify swap order: swapon --show   (zram should be listed above the disk partition)"
