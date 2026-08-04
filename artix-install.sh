@@ -228,7 +228,7 @@ STAGE2_PKGS=(
     # XFCE desktop, no xfce4-goodies (optional bloat). xfce4-power-manager
     # is NOT part of that bloat though - it's a separate package and it's
     # what handles lid-close/battery/brightness keys on this laptop.
-    xfce4 xfce4-power-manager
+    xfce4 xfce4-goodies
 
     # No display manager - default getty login prompt + startx instead.
     # Avoids the whole class of getty-vs-login-manager tty conflicts entirely.
