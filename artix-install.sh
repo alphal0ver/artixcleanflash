@@ -157,13 +157,21 @@ BASE_PKGS=(
     base linux-lts linux-firmware-intel intel-ucode
 
     # dinit init system + system bus. Needed at this stage so the chroot
-    # itself has an init/dbus present. Seat/device access for sway is
-    # handled later by seatd-dinit (Stage 2), NOT elogind-dinit - the two
-    # provide the same virtual package (init-logind) and conflict with
-    # each other, so only one can be installed. seatd is the one sway
-    # actually needs.
+    # itself has an init/dbus present.
     dinit
     dbus dbus-dinit
+
+    # IMPORTANT: seatd/seatd-dinit are installed HERE, in the same
+    # basestrap call as "base", not later in Stage 2. The "base" meta
+    # package itself requires the virtual "init-logind", and if nothing
+    # satisfying it is present in the transaction, pacman silently
+    # defaults to pulling in elogind-dinit to satisfy that requirement -
+    # which then hard-conflicts with seatd-dinit (both provide
+    # init-logind) the moment Stage 2 tries to add it. Listing
+    # seatd-dinit alongside base up front means pacman satisfies base's
+    # requirement with seatd from the very first transaction, so
+    # elogind-dinit is never pulled in at all.
+    seatd seatd-dinit
 
     # Core essentials - not desktop-specific, a base system needs these
     # regardless of what's layered on top later.
@@ -230,12 +238,9 @@ STAGE2_PKGS=(
     # talks to the kernel (DRM/KMS) + libinput directly, no X server.
     mesa libinput vulkan-intel
 
-    # seatd handles seat/device access (GPU, input devices) for sway,
-    # entirely without logind/elogind/systemd - this is the sole seat
-    # manager on this install (elogind-dinit was deliberately left out
-    # of Stage 1, see above, since it conflicts with seatd-dinit). User
-    # gets added to the 'seat' group below.
-    seatd seatd-dinit
+    # (seatd/seatd-dinit already installed back in Stage 1's basestrap
+    # call - see BASE_PKGS above. User is added to the 'seat' group
+    # below so it can talk to seatd without extra setup.)
 
     # sway + the pieces sway does NOT bundle itself:
     #   swaybg     - wallpaper
