@@ -131,23 +131,20 @@ log_step "Ensuring up-to-date keyrings..."
 # Artix pulls packages from both its own repos and Arch's (via world/galaxy),
 # so both keyrings need to be current and populated.
 #
-# This is -Syu (full sync + upgrade), not just -Sy. The live session's
-# root is a RAM-backed tmpfs overlay on top of the squashfs, not real
-# disk, so -Syu here upgrades every package already installed on the
-# live media (including linux-headers) inside that overlay. That used
-# to be too risky on 4GB of RAM; now that the machine has 8GB, there's
-# enough headroom for it. This also has the side benefit of forcing a
-# full re-download of every sync db, which clears out any corrupted
-# local db cache from a previous run (the "damaged tar archive" class
-# of error) instead of silently trusting a stale/bad local copy.
-pacman -Syu --noconfirm
+# IMPORTANT: this is -Sy (sync db only), not -Syu. The live session's root
+# is a RAM-backed tmpfs overlay on top of the squashfs, not real disk -
+# -Syu would upgrade every package already installed on the live media
+# (including linux-headers), and on a 4GB machine there isn't enough RAM
+# left in that overlay to extract a full kernel upgrade. -Sy + a targeted
+# --needed install only touches the two packages we actually need.
+pacman -Sy --noconfirm
 pacman -S --noconfirm --needed artix-keyring archlinux-keyring
 pacman-key --populate artix archlinux
 
 log_step "Installing minimal base system..."
 # Stage 1: just enough to get a bootable, chroot-able system. Everything
-# else (networking, sway+waybar, audio, bootloader, zram) gets installed
-# in Stage 2 via a plain `pacman -S` right after artix-chroot - see below.
+# else (networking, XFCE, audio, bootloader, zram) gets installed in
+# Stage 2 via a plain `pacman -S` right after artix-chroot - see below.
 # This is a checkpoint, not a technical requirement: pacman already runs
 # package scriptlets inside a real chroot() whenever --root != "/", so
 # basestrap and a later `artix-chroot ... pacman -S` behave identically
@@ -184,11 +181,11 @@ sed -i '\#[[:space:]]/[[:space:]].*ext4# s/relatime/relatime,discard/' /mnt/etc/
 # Swap partition - also enable discard.
 sed -i '/none[[:space:]]\+swap/ s/defaults/defaults,discard/' /mnt/etc/fstab
 
-# Note: zram's config file (/etc/zramen.conf) and the swappiness sysctl
+# Note: zram's config file (/etc/conf.d/zramen) and the swappiness sysctl
 # are written *inside* the chroot below, after the zramen package is
 # actually installed in Stage 2 - writing them here (before the package
 # exists) would just get silently overwritten once pacman installs its
-# own default config on top.
+# own default /etc/conf.d/zramen on top.
 
 # ==============================================================================
 # System Configuration (Chroot)
@@ -209,7 +206,7 @@ USERNAME="$(cat /etc/install_username)"
 TIMEZONE="$(cat /etc/install_timezone)"
 
 echo "-> Stage 2: installing everything beyond the minimal base..."
-pacman -Syu --noconfirm
+pacman -Sy --noconfirm
 
 STAGE2_PKGS=(
     # Networking: connman instead of NetworkManager - lighter daemon,
@@ -222,46 +219,23 @@ STAGE2_PKGS=(
     # swap is only the fallback once zram fills up.
     zramen zramen-dinit
 
-    # Graphics: HD 4600 is handled by the generic "modesetting"/kms
-    # driver inside mesa - no separate xf86-video-intel needed (it's
-    # unmaintained and worse than modesetting on Haswell). No xorg
-    # packages at all this time - sway is a Wayland compositor and
-    # talks to the kernel (DRM/KMS) + libinput directly, no X server.
-    mesa libinput vulkan-intel
+    # Graphics: HD 4600 is handled by the generic "modesetting" driver
+    # inside mesa - no separate xf86-video-intel needed (it's
+    # unmaintained and worse than modesetting on Haswell).
+    # xf86-input-libinput drives both the Synaptics touchpad and TrackPoint.
+    xorg-server mesa xf86-input-libinput
 
-    # seatd handles seat/device access (GPU, input devices) for Wayland
-    # compositors without needing logind/systemd - this is what sway
-    # actually needs at runtime beyond elogind. User gets added to the
-    # 'seat' group below.
-    seatd seatd-dinit
+    # XFCE desktop, no xfce4-goodies (optional bloat). xfce4-power-manager
+    # is NOT part of that bloat though - it's a separate package and it's
+    # what handles lid-close/battery/brightness keys on this laptop.
+    xfce4 xfce4-goodies
 
-    # sway + the pieces sway does NOT bundle itself:
-    #   swaybg     - wallpaper
-    #   swayidle   - idle management (screen lock/off triggers)
-    #   swaylock   - the lock screen itself
-    #   waybar     - status bar
-    #   wofi       - app launcher (rofi-equivalent for wayland)
-    #   mako       - notification daemon
-    #   grim/slurp - screenshot tool + region selector
-    #   xorg-xwayland - lets plain X11 apps still run under sway
-    sway swaybg swayidle swaylock waybar wofi mako grim slurp xorg-xwayland
+    # No display manager - default getty login prompt + startx instead.
+    # Avoids the whole class of getty-vs-login-manager tty conflicts entirely.
+    xorg-xinit
 
-    # Qt/GTK apps need these to render natively on Wayland instead of
-    # falling back to a blurry XWayland bridge.
-    qt5-wayland qt6-wayland
-
-    # polkit + a polkit authentication agent - GUI apps (e.g. package
-    # managers, some settings tools) need this to prompt for sudo
-    # graphically instead of failing silently.
-    polkit polkit-gnome
-
-    # A terminal - kitty carried over as the default since it's a solid
-    # choice either way; swap for foot/alacritty/whatever later.
-    kitty
-
-    # Audio: pipewire stack. No system dinit service needed - sway
-    # launches it via XDG autostart / systemd-free dbus activation
-    # when you log in.
+    # Audio: pipewire stack. No system dinit service needed - XFCE
+    # launches it via XDG autostart entries when you log in.
     pipewire pipewire-alsa pipewire-pulse wireplumber
 )
 pacman -S --noconfirm --needed "${STAGE2_PKGS[@]}"
@@ -299,7 +273,7 @@ echo "-> Tuning swappiness for zram..."
 mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-zram.conf << 'SYSCTL_EOF'
 # Higher swappiness makes sense when the primary swap target is
-# fast zram rather than disk. Adjust down if things feel less snappy.
+# fast zram rather than disk. Adjust down if XFCE feels less snappy.
 vm.swappiness = 130
 SYSCTL_EOF
 
@@ -354,7 +328,6 @@ enable_svc_try() {
 
 enable_svc dbus
 enable_svc elogind
-enable_svc seatd
 enable_svc_try connman connmand
 enable_svc zramen
 
@@ -362,7 +335,7 @@ enable_svc zramen
 # to pin down reliably across dinit versions). tty1's default agetty
 # (already enabled out of the box, nothing to configure) gives a plain
 # username/password prompt on its own - .bash_profile below auto-starts
-# sway right after a successful login.
+# X right after a successful login.
 
 echo "-> Setting up Chaotic-AUR (prebuilt binary packages, no compiling needed)..."
 # keyserver.ubuntu.com is occasionally flaky - fall back to keys.openpgp.org
@@ -380,67 +353,24 @@ if ! grep -q '\[chaotic-aur\]' /etc/pacman.conf; then
 Include = /etc/pacman.d/chaotic-mirrorlist
 CHAOTIC_EOF
 fi
-pacman -Syu --noconfirm
+pacman -Sy --noconfirm
 
 echo "-> Creating user '$USERNAME'..."
-# 'seat' group added here so the user can talk to seatd without extra
-# setup - required for sway to get GPU/input access without logind.
-useradd -m -G wheel,seat -s /bin/bash "$USERNAME"
+useradd -m -G wheel -s /bin/bash "$USERNAME"
 
-echo "-> Setting up auto-launch sway for '$USERNAME'..."
+echo "-> Setting up auto-startx for '$USERNAME'..."
 # After you type your username/password at the tty1 login prompt, this
-# starts sway automatically - only on tty1, only if no Wayland session
-# is already running. Wrapped in dbus-run-session so sway gets its own
-# working session bus (needed by waybar, mako, polkit-gnome, etc.)
-# without relying on systemd's user-session bus activation.
+# starts X automatically - only on tty1, only if X isn't already running,
+# so switching to another tty and back doesn't try to spawn a second X.
 cat > "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
-if [[ -z "${WAYLAND_DISPLAY:-}" && "$(tty)" == "/dev/tty1" ]]; then
-    export XDG_SESSION_TYPE=wayland
-    export XDG_CURRENT_DESKTOP=sway
-    export MOZ_ENABLE_WAYLAND=1
-    export QT_QPA_PLATFORM=wayland
-    exec dbus-run-session sway
+if [[ -z "$DISPLAY" && "$(tty)" == "/dev/tty1" ]]; then
+    exec startx
 fi
 PROFILE_EOF
-chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
-
-# Minimal starting sway config: default keybindings/workspaces via
-# sway's own bundled default (copied from /etc/sway/config on first
-# run if none exists), plus wiring in waybar as the bar and wofi as
-# the launcher so you have working basics before you rice it further.
-mkdir -p "/home/$USERNAME/.config/sway"
-cat > "/home/$USERNAME/.config/sway/config" << 'SWAYCONF_EOF'
-# Start from sway's own defaults, then override just what we care
-# about right now. See `man 5 sway` for the full option list, and
-# /etc/sway/config for the full commented reference.
-include /etc/sway/config.d/*
-
-set $mod Mod4
-set $term kitty
-set $menu wofi --show drun
-
-bindsym $mod+Return exec $term
-bindsym $mod+d exec $menu
-bindsym $mod+Shift+q kill
-bindsym $mod+Shift+c reload
-bindsym $mod+Shift+e exec swaynag -t warning -m 'Exit sway?' -B 'Yes' 'swaymsg exit'
-
-# floating toggle + minimize-equivalent (scratchpad)
-bindsym $mod+Shift+space floating toggle
-bindsym $mod+Shift+minus move scratchpad
-bindsym $mod+minus scratchpad show
-
-bar {
-    swaybar_command waybar
-}
-
-output * bg #1d1f21 solid_color
-exec swaybg -c '#1d1f21'
-exec mako
-exec /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
-SWAYCONF_EOF
-mkdir -p "/home/$USERNAME/.config/waybar"
-chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config"
+cat > "/home/$USERNAME/.xinitrc" << 'XINITRC_EOF'
+exec startxfce4
+XINITRC_EOF
+chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile" "/home/$USERNAME/.xinitrc"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
@@ -485,10 +415,8 @@ echo "  2. Remove the installation USB"
 echo "  3. reboot"
 echo ""
 echo "After reboot:"
-echo "  - You'll get a plain login prompt on tty1; log in and sway starts automatically."
+echo "  - You'll get a plain login prompt on tty1; log in and XFCE starts automatically."
 echo "  - Wifi: connmanctl enable wifi; connmanctl scan wifi; connmanctl connect <service>"
 echo "  - Verify zram:   zramctl        (should show a ~2GB zstd device, priority 32767)"
 echo "  - Verify swap order: swapon --show   (zram should be listed above the disk partition)"
 echo "  - If a service didn't start, check: dinitctl list"
-echo "  - Sway keys to know: \$mod=Super. Super+Enter=terminal, Super+d=launcher,"
-echo "    Super+Shift+space=float toggle, Super+minus=scratchpad hide/show."
