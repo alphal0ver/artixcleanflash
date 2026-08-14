@@ -266,13 +266,15 @@ STAGE2_PKGS=(
     # choice either way; swap for foot/alacritty/whatever later.
     kitty
 
-    # Audio: pipewire stack. No system dinit service needed - sway
-    # launches it via XDG autostart / systemd-free dbus activation
-    # when you log in. pipewire-jack pinned explicitly (it satisfies
-    # the virtual 'jack' dependency other packages want) so pacman
-    # doesn't stop to interactively ask jack2-vs-pipewire-jack - it's
-    # the right pick anyway since jack2 would be a redundant separate
-    # audio server alongside pipewire.
+    # Audio: pipewire stack. No system-level dinit service for these -
+    # they're user session daemons, launched explicitly via `exec` lines
+    # in the sway config below (see the runtime-dir service + sway
+    # config further down for why that's necessary without elogind).
+    # pipewire-jack pinned explicitly (it satisfies the virtual 'jack'
+    # dependency other packages want) so pacman doesn't stop to
+    # interactively ask jack2-vs-pipewire-jack - it's the right pick
+    # anyway since jack2 would be a redundant separate audio server
+    # alongside pipewire.
     pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber
 
     # Pinned explicitly so pacman doesn't stop mid-install to ask which
@@ -403,6 +405,28 @@ echo "-> Creating user '$USERNAME'..."
 # setup - required for sway to get GPU/input access without logind.
 useradd -m -G wheel,seat -s /bin/bash "$USERNAME"
 
+echo "-> Setting up XDG_RUNTIME_DIR (no elogind/systemd to do this for us)..."
+# On systemd or elogind systems, XDG_RUNTIME_DIR (a per-user directory
+# for sockets - pipewire, wireplumber, wayland itself all need this) is
+# created automatically at login via a PAM module. We deliberately have
+# neither elogind nor systemd, so nothing does this automatically -
+# without it, pipewire/wireplumber simply have nowhere to put their
+# sockets and fail to connect, which looks like a pipewire problem but
+# isn't one.
+#
+# Rather than reaching for a per-user service manager (dinit --user or
+# similar) just to recreate what's normally a one-line mkdir, this is a
+# tiny dinit boot service that creates a static /run/user/<uid> for our
+# one known user, correctly owned and permissioned, before the login
+# prompt even appears. /run is already a tmpfs (standard on Artix), so
+# this is recreated fresh on every boot - nothing to clean up.
+USER_UID="$(id -u "$USERNAME")"
+cat > /etc/dinit.d/runtime-dir << RUNTIMEDIR_EOF
+type = scripted
+command = /bin/sh -c 'mkdir -p /run/user/${USER_UID} && chown ${USERNAME}:${USERNAME} /run/user/${USER_UID} && chmod 0700 /run/user/${USER_UID}'
+RUNTIMEDIR_EOF
+enable_svc runtime-dir
+
 echo "-> Setting up auto-launch sway for '$USERNAME'..."
 # After you type your username/password at the tty1 login prompt, this
 # starts sway automatically - only on tty1, only if no Wayland session
@@ -411,6 +435,9 @@ echo "-> Setting up auto-launch sway for '$USERNAME'..."
 # without relying on systemd's user-session bus activation.
 cat > "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
 if [[ -z "${WAYLAND_DISPLAY:-}" && "$(tty)" == "/dev/tty1" ]]; then
+    # Created at boot by the runtime-dir dinit service (no elogind/
+    # systemd present to do this automatically) - just point at it here.
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
     export XDG_SESSION_TYPE=wayland
     export XDG_CURRENT_DESKTOP=sway
     export MOZ_ENABLE_WAYLAND=1
@@ -454,6 +481,16 @@ output * bg #1d1f21 solid_color
 exec swaybg -c '#1d1f21'
 exec mako
 exec /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
+
+# Pipewire has to be started explicitly here - on a systemd or elogind
+# system this happens automatically via user-session bus activation,
+# but we have neither, so nothing launches these on its own. Order
+# doesn't matter much (they connect over sockets once up), but
+# wireplumber (session/policy manager) after pipewire (the daemon
+# itself) is the conventional order.
+exec pipewire
+exec wireplumber
+exec pipewire-pulse
 SWAYCONF_EOF
 mkdir -p "/home/$USERNAME/.config/waybar"
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config"
