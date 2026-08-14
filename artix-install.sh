@@ -156,9 +156,13 @@ BASE_PKGS=(
     # only (not the full linux-firmware) since it's the only vendor here.
     base linux-lts linux-firmware-intel intel-ucode
 
-    # dinit init system + session/login tracking (elogind) + system bus.
-    # Needed at this stage so the chroot itself has an init/dbus present.
-    dinit elogind-dinit
+    # dinit init system + system bus. Needed at this stage so the chroot
+    # itself has an init/dbus present. Seat/device access for sway is
+    # handled later by seatd-dinit (Stage 2), NOT elogind-dinit - the two
+    # provide the same virtual package (init-logind) and conflict with
+    # each other, so only one can be installed. seatd is the one sway
+    # actually needs.
+    dinit
     dbus dbus-dinit
 
     # Core essentials - not desktop-specific, a base system needs these
@@ -226,10 +230,11 @@ STAGE2_PKGS=(
     # talks to the kernel (DRM/KMS) + libinput directly, no X server.
     mesa libinput vulkan-intel
 
-    # seatd handles seat/device access (GPU, input devices) for Wayland
-    # compositors without needing logind/systemd - this is what sway
-    # actually needs at runtime beyond elogind. User gets added to the
-    # 'seat' group below.
+    # seatd handles seat/device access (GPU, input devices) for sway,
+    # entirely without logind/elogind/systemd - this is the sole seat
+    # manager on this install (elogind-dinit was deliberately left out
+    # of Stage 1, see above, since it conflicts with seatd-dinit). User
+    # gets added to the 'seat' group below.
     seatd seatd-dinit
 
     # sway + the pieces sway does NOT bundle itself:
@@ -258,8 +263,18 @@ STAGE2_PKGS=(
 
     # Audio: pipewire stack. No system dinit service needed - sway
     # launches it via XDG autostart / systemd-free dbus activation
-    # when you log in.
-    pipewire pipewire-alsa pipewire-pulse wireplumber
+    # when you log in. pipewire-jack pinned explicitly (it satisfies
+    # the virtual 'jack' dependency other packages want) so pacman
+    # doesn't stop to interactively ask jack2-vs-pipewire-jack - it's
+    # the right pick anyway since jack2 would be a redundant separate
+    # audio server alongside pipewire.
+    pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber
+
+    # Pinned explicitly so pacman doesn't stop mid-install to ask which
+    # of 8 providers satisfies some package's virtual 'ttf-font'
+    # dependency - ttf-dejavu is a solid, lightweight, broadly-hinted
+    # default. Swap/add nerd fonts later once you're theming waybar.
+    ttf-dejavu
 )
 pacman -S --noconfirm --needed "${STAGE2_PKGS[@]}"
 
@@ -350,7 +365,6 @@ enable_svc_try() {
 }
 
 enable_svc dbus
-enable_svc elogind
 enable_svc seatd
 enable_svc_try connman connmand
 enable_svc zramen
