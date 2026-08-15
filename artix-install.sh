@@ -287,11 +287,20 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
     exec dbus-run-session -- "$SHELL" -l
 fi
 
-# Auto-start PipeWire sound server if not already running (once per login)
+# Kill any PipeWire instances left over from a previous login - they'd
+# still be attached to that login's now-dead D-Bus bus (dbus-run-session
+# tears the bus down on logout, but doesn't touch background processes
+# started with &). Killing and restarting here guarantees a single
+# instance, correctly attached to THIS login's bus, every time.
 if [ -n "$XDG_RUNTIME_DIR" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
-    pgrep -u "$USER" -x pipewire       >/dev/null || pipewire &
-    pgrep -u "$USER" -x pipewire-pulse >/dev/null || pipewire-pulse &
-    pgrep -u "$USER" -x wireplumber    >/dev/null || wireplumber &
+    pkill -u "$USER" -x pipewire-pulse 2>/dev/null
+    pkill -u "$USER" -x wireplumber 2>/dev/null
+    pkill -u "$USER" -x pipewire 2>/dev/null
+    sleep 0.5
+
+    pipewire &
+    wireplumber &
+    pipewire-pulse &
 fi
 PROFILE_EOF
 chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
