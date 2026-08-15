@@ -161,7 +161,7 @@ echo "-> Stage 2: installing everything beyond the minimal base..."
 pacman -Sy --noconfirm
 
 STAGE2_PKGS=(
-    connman connman-dinit wpa_supplicant
+    networkmanager networkmanager-dinit
     zramen zramen-dinit
     mesa libinput vulkan-intel
     pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber
@@ -235,7 +235,7 @@ enable_svc_try() {
 
 enable_svc dbus
 enable_svc seatd
-enable_svc_try connman connmand
+enable_svc_try NetworkManager networkmanager
 enable_svc zramen
 
 echo "-> Setting up Chaotic-AUR..."
@@ -260,18 +260,34 @@ useradd -m -G wheel,seat -s /bin/bash "$USERNAME"
 echo "-> Setting up XDG_RUNTIME_DIR for user..."
 USER_UID="$(id -u "$USERNAME")"
 
-# FIX: Escaped inner variables so dinit evaluates them correctly at boot time
 cat > /etc/dinit.d/runtime-dir << RUNTIMEDIR_EOF
 type = scripted
 command = /bin/sh -c 'mkdir -p /run/user/${USER_UID} && chown ${USERNAME}:${USERNAME} /run/user/${USER_UID} && chmod 0700 /run/user/${USER_UID}'
 RUNTIMEDIR_EOF
 enable_svc runtime-dir
 
-# FIX: Export XDG_RUNTIME_DIR in bash_profile so user applications (Caelestia/Wayland/PipeWire) know where sockets are
 cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 PROFILE_EOF
 chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
+
+echo "-> Auto-starting PipeWire & WirePlumber via bashrc..."
+cat >> "/home/$USERNAME/.bashrc" << 'BASHRC_EOF'
+
+# Auto-start PipeWire sound server if not running
+if [ -n "$XDG_RUNTIME_DIR" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    if ! pgrep -u "$USER" -x pipewire >/dev/null; then
+        pipewire &
+    fi
+    if ! pgrep -u "$USER" -x pipewire-pulse >/dev/null; then
+        pipewire-pulse &
+    fi
+    if ! pgrep -u "$USER" -x wireplumber >/dev/null; then
+        wireplumber &
+    fi
+fi
+BASHRC_EOF
+chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bashrc"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
@@ -279,7 +295,7 @@ echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
 
 echo "-> Setting up realtime audio scheduling (rtprio)..."
 groupadd -f realtime
-usermod -aG realtime,audio,video "$USERNAME"
+usermod -aG realtime,audio,video,network "$USERNAME"
 mkdir -p /etc/security/limits.d
 cat > /etc/security/limits.d/99-realtime-audio.conf << 'LIMITS_EOF'
 @realtime - rtprio 95
@@ -310,6 +326,7 @@ echo "  3. reboot"
 echo ""
 echo "After reboot:"
 echo "  - Log in at the tty1 prompt."
-echo "  - Wifi: connmanctl enable wifi; connmanctl scan wifi; connmanctl connect <service>"
-echo "  - Verify zram:   zramctl"
-echo "  - Verify audio limits: ulimit -r -l"
+echo "  - Connect to Wi-Fi: nmcli device wifi connect <SSID> password <PASSWORD>"
+echo "  - Verify zram:       zramctl"
+echo "  - Verify PipeWire:   wpctl status"
+echo "  - Verify audio:      ulimit -r -l"
