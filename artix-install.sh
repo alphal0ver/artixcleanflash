@@ -266,28 +266,35 @@ command = /bin/sh -c 'mkdir -p /run/user/${USER_UID} && chown ${USERNAME}:${USER
 RUNTIMEDIR_EOF
 enable_svc runtime-dir
 
+echo "-> Setting up session D-Bus + PipeWire startup at login..."
+# This runs ONCE per login (in .bash_profile), not once per shell (.bashrc
+# would relaunch pipewire in every new terminal). It also guarantees a
+# session D-Bus exists before pipewire/wireplumber start - without one,
+# they log "Unable to autolaunch a dbus-daemon without a $DISPLAY for X11"
+# on a bare console, since there's no X/Wayland/display-manager here to
+# autolaunch one for them.
+#
+# The whole login shell re-execs itself once inside `dbus-run-session`,
+# which sets DBUS_SESSION_BUS_ADDRESS. The env check below stops it from
+# looping on the re-exec. Once Hyprland/a compositor is installed, this
+# same dbus-run-session wrapper can instead wrap the compositor directly
+# (e.g. `exec dbus-run-session -- Hyprland`) and this block becomes
+# unnecessary - the compositor's own exec-once can start pipewire instead.
 cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    exec dbus-run-session -- "$SHELL" -l
+fi
+
+# Auto-start PipeWire sound server if not already running (once per login)
+if [ -n "$XDG_RUNTIME_DIR" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    pgrep -u "$USER" -x pipewire       >/dev/null || pipewire &
+    pgrep -u "$USER" -x pipewire-pulse >/dev/null || pipewire-pulse &
+    pgrep -u "$USER" -x wireplumber    >/dev/null || wireplumber &
+fi
 PROFILE_EOF
 chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
-
-echo "-> Auto-starting PipeWire & WirePlumber via bashrc..."
-cat >> "/home/$USERNAME/.bashrc" << 'BASHRC_EOF'
-
-# Auto-start PipeWire sound server if not running
-if [ -n "$XDG_RUNTIME_DIR" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
-    if ! pgrep -u "$USER" -x pipewire >/dev/null; then
-        pipewire &
-    fi
-    if ! pgrep -u "$USER" -x pipewire-pulse >/dev/null; then
-        pipewire-pulse &
-    fi
-    if ! pgrep -u "$USER" -x wireplumber >/dev/null; then
-        wireplumber &
-    fi
-fi
-BASHRC_EOF
-chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bashrc"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
