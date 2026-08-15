@@ -22,9 +22,9 @@ log_err()  { echo -e "\e[1;31mERROR:\e[0m $1" >&2; exit 1; }
 # ==============================================================================
 # Pre-flight Checks
 # ==============================================================================
-[[ $EUID -ne 0 ]]       && log_err "This script must be run as root."
+[[ $EUID -ne 0 ]]        && log_err "This script must be run as root."
 [[ ! -d /sys/firmware/efi ]] && log_err "System not booted in UEFI mode."
-[[ ! -b "$DISK" ]]       && log_err "Disk '$DISK' not found or is not a block device."
+[[ ! -b "$DISK" ]]        && log_err "Disk '$DISK' not found or is not a block device."
 
 log_step "Checking for required tools..."
 declare -A REQUIRED_TOOLS=(
@@ -161,7 +161,7 @@ echo "-> Stage 2: installing everything beyond the minimal base..."
 pacman -Sy --noconfirm
 
 STAGE2_PKGS=(
-    networkmanager networkmanager-dinit
+    networkmanager networkmanager-dinit wpa_supplicant
     zramen zramen-dinit
     mesa libinput vulkan-intel
     pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber
@@ -235,7 +235,7 @@ enable_svc_try() {
 
 enable_svc dbus
 enable_svc seatd
-enable_svc_try NetworkManager networkmanager
+enable_svc_try networkmanager NetworkManager
 enable_svc zramen
 
 echo "-> Setting up Chaotic-AUR..."
@@ -260,13 +260,18 @@ useradd -m -G wheel,seat -s /bin/bash "$USERNAME"
 echo "-> Setting up XDG_RUNTIME_DIR for user..."
 USER_UID="$(id -u "$USERNAME")"
 
+# FIX: Escaped inner variables so dinit evaluates them correctly at boot time
 cat > /etc/dinit.d/runtime-dir << RUNTIMEDIR_EOF
 type = scripted
 command = /bin/sh -c 'mkdir -p /run/user/${USER_UID} && chown ${USERNAME}:${USERNAME} /run/user/${USER_UID} && chmod 0700 /run/user/${USER_UID}'
 RUNTIMEDIR_EOF
 enable_svc runtime-dir
 
-echo "-> Skipping PipeWire auto-start - will be launched via Hyprland/Caelestia's exec-once after that's installed."
+# FIX: Export XDG_RUNTIME_DIR in bash_profile so user applications (Caelestia/Wayland/PipeWire) know where sockets are
+cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+PROFILE_EOF
+chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
@@ -274,7 +279,7 @@ echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
 
 echo "-> Setting up realtime audio scheduling (rtprio)..."
 groupadd -f realtime
-usermod -aG realtime,audio,video,network "$USERNAME"
+usermod -aG realtime,audio,video "$USERNAME"
 mkdir -p /etc/security/limits.d
 cat > /etc/security/limits.d/99-realtime-audio.conf << 'LIMITS_EOF'
 @realtime - rtprio 95
@@ -305,7 +310,6 @@ echo "  3. reboot"
 echo ""
 echo "After reboot:"
 echo "  - Log in at the tty1 prompt."
-echo "  - Connect to Wi-Fi: nmcli device wifi connect <SSID> password <PASSWORD>"
-echo "  - Verify zram:       zramctl"
-echo "  - Verify PipeWire:   wpctl status"
-echo "  - Verify audio:      ulimit -r -l"
+echo "  - Wifi: nmcli device wifi connect <SSID> password <password>"
+echo "  - Verify zram:   zramctl"
+echo "  - Verify audio limits: ulimit -r -l"
