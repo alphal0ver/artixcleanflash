@@ -266,44 +266,7 @@ command = /bin/sh -c 'mkdir -p /run/user/${USER_UID} && chown ${USERNAME}:${USER
 RUNTIMEDIR_EOF
 enable_svc runtime-dir
 
-echo "-> Setting up session D-Bus + PipeWire startup at login..."
-# This runs ONCE per login (in .bash_profile), not once per shell (.bashrc
-# would relaunch pipewire in every new terminal). It also guarantees a
-# session D-Bus exists before pipewire/wireplumber start - without one,
-# they log "Unable to autolaunch a dbus-daemon without a $DISPLAY for X11"
-# on a bare console, since there's no X/Wayland/display-manager here to
-# autolaunch one for them.
-#
-# The whole login shell re-execs itself once inside `dbus-run-session`,
-# which sets DBUS_SESSION_BUS_ADDRESS. The env check below stops it from
-# looping on the re-exec. Once Hyprland/a compositor is installed, this
-# same dbus-run-session wrapper can instead wrap the compositor directly
-# (e.g. `exec dbus-run-session -- Hyprland`) and this block becomes
-# unnecessary - the compositor's own exec-once can start pipewire instead.
-cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    exec dbus-run-session -- "$SHELL" -l
-fi
-
-# Kill any PipeWire instances left over from a previous login - they'd
-# still be attached to that login's now-dead D-Bus bus (dbus-run-session
-# tears the bus down on logout, but doesn't touch background processes
-# started with &). Killing and restarting here guarantees a single
-# instance, correctly attached to THIS login's bus, every time.
-if [ -n "$XDG_RUNTIME_DIR" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
-    pkill -u "$USER" -x pipewire-pulse 2>/dev/null
-    pkill -u "$USER" -x wireplumber 2>/dev/null
-    pkill -u "$USER" -x pipewire 2>/dev/null
-    sleep 0.5
-
-    pipewire &
-    wireplumber &
-    pipewire-pulse &
-fi
-PROFILE_EOF
-chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
+echo "-> Skipping PipeWire auto-start - will be launched via Hyprland/Caelestia's exec-once after that's installed."
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
