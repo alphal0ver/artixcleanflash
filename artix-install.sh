@@ -242,6 +242,30 @@ STAGE2_PKGS=(
     # call - see BASE_PKGS above. User is added to the 'seat' group
     # below so it can talk to seatd without extra setup.)
 
+    # sway + the pieces sway does NOT bundle itself:
+    #   swaybg     - wallpaper
+    #   swayidle   - idle management (screen lock/off triggers)
+    #   swaylock   - the lock screen itself
+    #   waybar     - status bar
+    #   wofi       - app launcher (rofi-equivalent for wayland)
+    #   mako       - notification daemon
+    #   grim/slurp - screenshot tool + region selector
+    #   xorg-xwayland - lets plain X11 apps still run under sway
+    sway swaybg swayidle swaylock waybar wofi mako grim slurp xorg-xwayland
+
+    # Qt/GTK apps need these to render natively on Wayland instead of
+    # falling back to a blurry XWayland bridge.
+    qt5-wayland qt6-wayland
+
+    # polkit + a polkit authentication agent - GUI apps (e.g. package
+    # managers, some settings tools) need this to prompt for sudo
+    # graphically instead of failing silently.
+    polkit polkit-gnome
+
+    # A terminal - kitty carried over as the default since it's a solid
+    # choice either way; swap for foot/alacritty/whatever later.
+    kitty
+
     # Audio: pipewire stack. No system-level dinit service for these -
     # they're user session daemons, launched explicitly via `exec` lines
     # in the sway config below (see the runtime-dir service + sway
@@ -402,6 +426,74 @@ type = scripted
 command = /bin/sh -c 'mkdir -p /run/user/${USER_UID} && chown ${USERNAME}:${USERNAME} /run/user/${USER_UID} && chmod 0700 /run/user/${USER_UID}'
 RUNTIMEDIR_EOF
 enable_svc runtime-dir
+
+echo "-> Setting up auto-launch sway for '$USERNAME'..."
+# After you type your username/password at the tty1 login prompt, this
+# starts sway automatically - only on tty1, only if no Wayland session
+# is already running. Wrapped in dbus-run-session so sway gets its own
+# working session bus (needed by waybar, mako, polkit-gnome, etc.)
+# without relying on systemd's user-session bus activation.
+cat > "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
+if [[ -z "${WAYLAND_DISPLAY:-}" && "$(tty)" == "/dev/tty1" ]]; then
+    # Created at boot by the runtime-dir dinit service (no elogind/
+    # systemd present to do this automatically) - just point at it here.
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_SESSION_TYPE=wayland
+    export XDG_CURRENT_DESKTOP=sway
+    export MOZ_ENABLE_WAYLAND=1
+    export QT_QPA_PLATFORM=wayland
+    exec dbus-run-session sway
+fi
+PROFILE_EOF
+chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
+
+# Minimal starting sway config: default keybindings/workspaces via
+# sway's own bundled default (copied from /etc/sway/config on first
+# run if none exists), plus wiring in waybar as the bar and wofi as
+# the launcher so you have working basics before you rice it further.
+mkdir -p "/home/$USERNAME/.config/sway"
+cat > "/home/$USERNAME/.config/sway/config" << 'SWAYCONF_EOF'
+# Start from sway's own defaults, then override just what we care
+# about right now. See `man 5 sway` for the full option list, and
+# /etc/sway/config for the full commented reference.
+include /etc/sway/config.d/*
+
+set $mod Mod4
+set $term kitty
+set $menu wofi --show drun
+
+bindsym $mod+Return exec $term
+bindsym $mod+d exec $menu
+bindsym $mod+Shift+q kill
+bindsym $mod+Shift+c reload
+bindsym $mod+Shift+e exec swaynag -t warning -m 'Exit sway?' -B 'Yes' 'swaymsg exit'
+
+# floating toggle + minimize-equivalent (scratchpad)
+bindsym $mod+Shift+space floating toggle
+bindsym $mod+Shift+minus move scratchpad
+bindsym $mod+minus scratchpad show
+
+bar {
+    swaybar_command waybar
+}
+
+output * bg #1d1f21 solid_color
+exec swaybg -c '#1d1f21'
+exec mako
+exec /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
+
+# Pipewire has to be started explicitly here - on a systemd or elogind
+# system this happens automatically via user-session bus activation,
+# but we have neither, so nothing launches these on its own. Order
+# doesn't matter much (they connect over sockets once up), but
+# wireplumber (session/policy manager) after pipewire (the daemon
+# itself) is the conventional order.
+exec pipewire
+exec wireplumber
+exec pipewire-pulse
+SWAYCONF_EOF
+mkdir -p "/home/$USERNAME/.config/waybar"
+chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
