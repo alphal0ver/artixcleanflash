@@ -138,8 +138,18 @@ log_step "Generating fstab..."
 fstabgen -U /mnt > /mnt/etc/fstab
 
 log_step "Enabling SSD TRIM (discard) on root + swap..."
+# NOTE: these edits assume fstabgen emitted the usual 'relatime' (ext4) /
+# 'defaults' (swap) options. We verify the edit actually landed rather than
+# failing silently if a future fstabgen ever changes its default wording.
 sed -i '\#[[:space:]]/[[:space:]].*ext4# s/relatime/relatime,discard/' /mnt/etc/fstab
+if ! grep 'ext4' /mnt/etc/fstab | grep -q 'discard'; then
+    echo "   WARNING: could not confirm 'discard' was added to the root fstab entry - check /mnt/etc/fstab manually."
+fi
+
 sed -i '/none[[:space:]]\+swap/ s/defaults/defaults,discard/' /mnt/etc/fstab
+if ! grep 'swap' /mnt/etc/fstab | grep -q 'discard'; then
+    echo "   WARNING: could not confirm 'discard' was added to the swap fstab entry - check /mnt/etc/fstab manually."
+fi
 
 # ==============================================================================
 # System Configuration (Chroot)
@@ -158,7 +168,11 @@ USERNAME="$(cat /etc/install_username)"
 TIMEZONE="$(cat /etc/install_timezone)"
 
 echo "-> Stage 2: installing everything beyond the minimal base..."
-pacman -Sy --noconfirm
+# Full upgrade (-Syu), not just a database sync (-Sy), to avoid partial
+# upgrades: syncing the db without upgrading already-installed packages can
+# leave newly-installed packages linked against libraries that are older
+# than what they expect.
+pacman -Syu --noconfirm
 
 STAGE2_PKGS=(
     networkmanager networkmanager-dinit wpa_supplicant
@@ -186,6 +200,8 @@ else
 fi
 
 echo "-> Tuning swappiness for zram..."
+# vm.swappiness up to 200 requires Linux 5.8+ (linux-lts qualifies); on
+# older kernels values above 100 are clamped back down to 100.
 mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-zram.conf << 'SYSCTL_EOF'
 vm.swappiness = 130
@@ -252,30 +268,98 @@ if ! grep -q '\[chaotic-aur\]' /etc/pacman.conf; then
 Include = /etc/pacman.d/chaotic-mirrorlist
 CHAOTIC_EOF
 fi
-pacman -Sy --noconfirm
+# Full upgrade after adding the new repo, not just a sync - same
+# partial-upgrade reasoning as above.
+pacman -Syu --noconfirm
 
 echo "-> Creating user '$USERNAME'..."
 useradd -m -G wheel,seat -s /bin/bash "$USERNAME"
 
 echo "-> Setting up XDG_RUNTIME_DIR for user..."
-USER_UID="$(id -u "$USERNAME")"
-
-# FIX: Escaped inner variables so dinit evaluates them correctly at boot time
+# The inner \$uid and \$( ) are escaped so they land in the service file
+# literally and are evaluated by /bin/sh at boot time via `id -u`, rather
+# than being baked in as a fixed UID captured during installation. This
+# keeps the service correct even if the account is ever recreated with a
+# different UID.
 cat > /etc/dinit.d/runtime-dir << RUNTIMEDIR_EOF
 type = scripted
-command = /bin/sh -c 'mkdir -p /run/user/${USER_UID} && chown ${USERNAME}:${USERNAME} /run/user/${USER_UID} && chmod 0700 /run/user/${USER_UID}'
+command = /bin/sh -c 'uid=\$(id -u ${USERNAME}) && mkdir -p /run/user/\$uid && chown ${USERNAME}:${USERNAME} /run/user/\$uid && chmod 0700 /run/user/\$uid'
 RUNTIMEDIR_EOF
 enable_svc runtime-dir
 
-# FIX: Export XDG_RUNTIME_DIR in bash_profile so user applications (Caelestia/Wayland/PipeWire) know where sockets are
+# Source .bashrc and export XDG_RUNTIME_DIR in bash_profile so user
+# applications (Caelestia/Wayland/PipeWire) know where sockets are
 cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
+[[ -f ~/.bashrc ]] && . ~/.bashrc
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+PROFILE_EOF
+chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
+
+echo "-> Setting up user-level dinit instance for PipeWire..."
+USER_DINIT_D="/home/$USERNAME/.config/dinit.d"
+mkdir -p "$USER_DINIT_D"
+
+# 'boot' is the target dinit brings up by default when started as a plain
+# user instance. Using direct depends-on lines (rather than a waits-for.d
+# directory of symlinks) - dinit still starts pipewire before wireplumber/
+# pipewire-pulse since those two declare their own depends-on = pipewire.
+cat > "$USER_DINIT_D/boot" << 'DINIT_BOOT_EOF'
+type = internal
+depends-on = pipewire
+depends-on = wireplumber
+depends-on = pipewire-pulse
+DINIT_BOOT_EOF
+
+cat > "$USER_DINIT_D/pipewire" << 'DINIT_PW_EOF'
+type = process
+command = /usr/bin/pipewire
+restart = true
+smooth-recovery = true
+DINIT_PW_EOF
+
+cat > "$USER_DINIT_D/wireplumber" << 'DINIT_WP_EOF'
+type = process
+command = /usr/bin/wireplumber
+depends-on = pipewire
+restart = true
+smooth-recovery = true
+DINIT_WP_EOF
+
+cat > "$USER_DINIT_D/pipewire-pulse" << 'DINIT_PWP_EOF'
+type = process
+command = /usr/bin/pipewire-pulse
+depends-on = pipewire
+restart = true
+smooth-recovery = true
+DINIT_PWP_EOF
+
+chown -R "$USERNAME:$USERNAME" "$USER_DINIT_D"
+
+# Start the user dinit instance from .bash_profile, once XDG_RUNTIME_DIR is
+# set and the socket dir exists (both handled above/by the runtime-dir
+# service). Poll for the pipewire socket instead of a fixed sleep, so we
+# don't race a slow boot chain before handing off to Hyprland.
+cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
+if ! pgrep -u "$(id -u)" -x dinit >/dev/null 2>&1; then
+    dinit --user -q &
+    disown
+fi
+
+for _ in $(seq 1 50); do
+    [[ -S "$XDG_RUNTIME_DIR/pipewire-0" ]] && break
+    sleep 0.1
+done
+
+if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+    dbus-run-session start-hyprland
+fi
 PROFILE_EOF
 chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
 echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
+visudo -cf /etc/sudoers.d/wheel || { echo "   ERROR: /etc/sudoers.d/wheel failed syntax check!" >&2; exit 1; }
 
 echo "-> Setting up realtime audio scheduling (rtprio)..."
 groupadd -f realtime
