@@ -22,9 +22,9 @@ log_err()  { echo -e "\e[1;31mERROR:\e[0m $1" >&2; exit 1; }
 # ==============================================================================
 # Pre-flight Checks
 # ==============================================================================
-[[ $EUID -ne 0 ]]        && log_err "This script must be run as root."
+[[ $EUID -ne 0 ]]            && log_err "This script must be run as root."
 [[ ! -d /sys/firmware/efi ]] && log_err "System not booted in UEFI mode."
-[[ ! -b "$DISK" ]]        && log_err "Disk '$DISK' not found or is not a block device."
+[[ ! -b "$DISK" ]]            && log_err "Disk '$DISK' not found or is not a block device."
 
 log_step "Checking for required tools..."
 declare -A REQUIRED_TOOLS=(
@@ -138,15 +138,12 @@ log_step "Generating fstab..."
 fstabgen -U /mnt > /mnt/etc/fstab
 
 log_step "Enabling SSD TRIM (discard) on root + swap..."
-# NOTE: these edits assume fstabgen emitted the usual 'relatime' (ext4) /
-# 'defaults' (swap) options. We verify the edit actually landed rather than
-# failing silently if a future fstabgen ever changes its default wording.
 sed -i '\#[[:space:]]/[[:space:]].*ext4# s/relatime/relatime,discard/' /mnt/etc/fstab
 if ! grep 'ext4' /mnt/etc/fstab | grep -q 'discard'; then
     echo "   WARNING: could not confirm 'discard' was added to the root fstab entry - check /mnt/etc/fstab manually."
 fi
 
-sed -i '/none[[:space:]]\+swap/ s/defaults/defaults,discard/' /mnt/etc/fstab
+sed -i '\#swap# s/defaults/defaults,discard/' /mnt/etc/fstab
 if ! grep 'swap' /mnt/etc/fstab | grep -q 'discard'; then
     echo "   WARNING: could not confirm 'discard' was added to the swap fstab entry - check /mnt/etc/fstab manually."
 fi
@@ -168,10 +165,6 @@ USERNAME="$(cat /etc/install_username)"
 TIMEZONE="$(cat /etc/install_timezone)"
 
 echo "-> Stage 2: installing everything beyond the minimal base..."
-# Full upgrade (-Syu), not just a database sync (-Sy), to avoid partial
-# upgrades: syncing the db without upgrading already-installed packages can
-# leave newly-installed packages linked against libraries that are older
-# than what they expect.
 pacman -Syu --noconfirm
 
 STAGE2_PKGS=(
@@ -200,8 +193,6 @@ else
 fi
 
 echo "-> Tuning swappiness for zram..."
-# vm.swappiness up to 200 requires Linux 5.8+ (linux-lts qualifies); on
-# older kernels values above 100 are clamped back down to 100.
 mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-zram.conf << 'SYSCTL_EOF'
 vm.swappiness = 130
@@ -268,30 +259,45 @@ if ! grep -q '\[chaotic-aur\]' /etc/pacman.conf; then
 Include = /etc/pacman.d/chaotic-mirrorlist
 CHAOTIC_EOF
 fi
-# Full upgrade after adding the new repo, not just a sync - same
-# partial-upgrade reasoning as above.
 pacman -Syu --noconfirm
 
 echo "-> Creating user '$USERNAME'..."
 useradd -m -G wheel,seat -s /bin/bash "$USERNAME"
 
 echo "-> Setting up XDG_RUNTIME_DIR for user..."
-# The inner \$uid and \$( ) are escaped so they land in the service file
-# literally and are evaluated by /bin/sh at boot time via `id -u`, rather
-# than being baked in as a fixed UID captured during installation. This
-# keeps the service correct even if the account is ever recreated with a
-# different UID.
-cat > /etc/dinit.d/runtime-dir << RUNTIMEDIR_EOF
+cat > /usr/local/bin/dinit-runtime-dir.sh << SCRIPT_EOF
+#!/bin/sh
+uid=\$(id -u "${USERNAME}")
+mkdir -p "/run/user/\$uid"
+chown ${USERNAME}:${USERNAME} "/run/user/\$uid"
+chmod 0700 "/run/user/\$uid"
+SCRIPT_EOF
+chmod 755 /usr/local/bin/dinit-runtime-dir.sh
+
+cat > /etc/dinit.d/runtime-dir << 'RUNTIMEDIR_EOF'
 type = scripted
-command = /bin/sh -c 'uid=\$(id -u ${USERNAME}) && mkdir -p /run/user/\$uid && chown ${USERNAME}:${USERNAME} /run/user/\$uid && chmod 0700 /run/user/\$uid'
+command = /bin/sh /usr/local/bin/dinit-runtime-dir.sh
 RUNTIMEDIR_EOF
 enable_svc runtime-dir
 
-# Source .bashrc and export XDG_RUNTIME_DIR in bash_profile so user
-# applications (Caelestia/Wayland/PipeWire) know where sockets are
-cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
+# Source .bashrc, export XDG_RUNTIME_DIR, and initialize user dinit
+cat > "/home/$USERNAME/.bash_profile" << PROFILE_EOF
 [[ -f ~/.bashrc ]] && . ~/.bashrc
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
+
+if ! pgrep -u "\$(id -u)" -x dinit >/dev/null 2>&1; then
+    dinit --user -q &
+    disown
+fi
+
+for _ in \$(seq 1 50); do
+    [[ -S "\$XDG_RUNTIME_DIR/pipewire-0" ]] && break
+    sleep 0.1
+done
+
+if [ -z "\$DISPLAY" ] && [ "\$(tty)" = "/dev/tty1" ]; then
+    dbus-run-session start-hyprland
+fi
 PROFILE_EOF
 chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
 
@@ -299,10 +305,6 @@ echo "-> Setting up user-level dinit instance for PipeWire..."
 USER_DINIT_D="/home/$USERNAME/.config/dinit.d"
 mkdir -p "$USER_DINIT_D"
 
-# 'boot' is the target dinit brings up by default when started as a plain
-# user instance. Using direct depends-on lines (rather than a waits-for.d
-# directory of symlinks) - dinit still starts pipewire before wireplumber/
-# pipewire-pulse since those two declare their own depends-on = pipewire.
 cat > "$USER_DINIT_D/boot" << 'DINIT_BOOT_EOF'
 type = internal
 depends-on = pipewire
@@ -334,27 +336,6 @@ smooth-recovery = true
 DINIT_PWP_EOF
 
 chown -R "$USERNAME:$USERNAME" "$USER_DINIT_D"
-
-# Start the user dinit instance from .bash_profile, once XDG_RUNTIME_DIR is
-# set and the socket dir exists (both handled above/by the runtime-dir
-# service). Poll for the pipewire socket instead of a fixed sleep, so we
-# don't race a slow boot chain before handing off to Hyprland.
-cat >> "/home/$USERNAME/.bash_profile" << 'PROFILE_EOF'
-if ! pgrep -u "$(id -u)" -x dinit >/dev/null 2>&1; then
-    dinit --user -q &
-    disown
-fi
-
-for _ in $(seq 1 50); do
-    [[ -S "$XDG_RUNTIME_DIR/pipewire-0" ]] && break
-    sleep 0.1
-done
-
-if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-    dbus-run-session start-hyprland
-fi
-PROFILE_EOF
-chown "$USERNAME:$USERNAME" "/home/$USERNAME/.bash_profile"
 
 echo "-> Configuring sudo..."
 install -m 440 /dev/null /etc/sudoers.d/wheel
